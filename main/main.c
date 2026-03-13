@@ -12,6 +12,7 @@
 #include "lvgl.h"
 #define I2C_SCL_NUM GPIO_NUM_11
 #define I2C_SDA_NUM GPIO_NUM_12
+#define I2C_ADDR 0x78
 #define I2C_SPEED 400*1000
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
@@ -24,6 +25,7 @@ static esp_lcd_panel_handle_t lcd_panel_hdl=NULL;//LCD面板句柄
 static esp_timer_handle_t lvgl_tick_timer_hdl=NULL;//lvgl时钟定时器句柄
 static uint8_t oled_buffer[OLED_WIDTH*OLED_HEIGHT/8];//OLED*显示*缓冲区,负责传入硬件(每个像素1bit色深,占用1位.数组中每个元素8位,可以存储8个像素)
 
+//???
 static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_hdl, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
     /*入参:
@@ -36,9 +38,59 @@ static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_hdl, esp_lcd_pa
     return false;
 }
 
-static void increase_lvgl_tick(void *arg)//每隔10ms调用一次,告知lvgl时间流逝了10ms
+static void increase_lvgl_tick(void *arg)//相当于lvgl时钟:每隔10ms调用一次,告知lvgl时间流逝了10ms
 {
     lv_tick_inc(LVGL_TICK_PERIOD_MS);
+}
+
+static void lvgl_flush_cb(lv_display_t *disp,lv_area_t *area,uint8_t *px)//将lvgl绘图缓冲区数据传入oled硬件缓冲区
+{
+    esp_lcd_panel_handle_t lcd_panel_hdl=lv_display_get_user_data(disp);
+    px+=LVGL_PALETTE_SIZE;//设置偏移量,跳过调色盘数据
+    int x1=area->x1;
+    int x2=area->x2;
+    int y1=area->y1;
+    int y2=area->y2;
+    uint8_t byte[8]={0};
+    uint8_t temp[8]={0};
+    for (int y = 0; y < y2/8-y1/8+1; y++)
+    {
+        for (int x = 0; x < x2-x1+1; x++)
+        {
+            temp[0]=px[(y1+y*8+0)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[1]=px[(y1+y*8+1)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[2]=px[(y1+y*8+2)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[3]=px[(y1+y*8+3)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[4]=px[(y1+y*8+4)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[5]=px[(y1+y*8+5)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[6]=px[(y1+y*8+6)*(OLED_WIDTH/8)+(x1+x)/8];
+            temp[7]=px[(y1+y*8+7)*(OLED_WIDTH/8)+(x1+x)/8];
+            for (int i = 0; i < 8; i++)
+            {
+                temp[0]=(temp[0]&0x80)>>7;//第[(y1行+行偏移量y)*(OLED_WIDTH/8)列+(x1列+列偏移量x)/8]个字节
+                temp[1]=(temp[1]&0x80)>>6;
+                temp[2]=(temp[2]&0x80)>>5;
+                temp[3]=(temp[3]&0x80)>>4;
+                temp[4]=(temp[4]&0x80)>>3;
+                temp[5]=(temp[5]&0x80)>>2;
+                temp[6]=(temp[6]&0x80)>>1;
+                temp[7]=(temp[7]&0x80)>>0;
+                byte[i]=temp[0]|temp[1]|temp[2]|temp[3]|temp[4]|temp[5]|temp[6]|temp[7];
+                //完成一个字节拼接后左移一位,方便再取第一位
+                temp[0]=px[(y1+y*8+0)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[1]=px[(y1+y*8+1)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[2]=px[(y1+y*8+2)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[3]=px[(y1+y*8+3)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[4]=px[(y1+y*8+4)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[5]=px[(y1+y*8+5)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[6]=px[(y1+y*8+6)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+                temp[7]=px[(y1+y*8+7)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
+            }
+            oled_buffer[(y1/8+y)*OLED_WIDTH+x1+x]=byte[(x1+x)%8];//第[(y1/8行+行偏移量y)*OLED_WIDTH列+(x1列+列偏移量x)]个字节
+            byte[(x1+x)%8]=0;
+        }
+    }
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel_hdl,x1,y1,x2+1,y2+1,oled_buffer));
 }
 
 void ssd1306_init()
@@ -60,7 +112,7 @@ void ssd1306_init()
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg,&i2c_bus_hdl));//新建I2C总线
 
     esp_lcd_panel_io_i2c_config_t lcd_io_cfg={
-        .dev_addr=0x78,//地址
+        .dev_addr=I2C_ADDR,//地址
         .scl_speed_hz=I2C_SPEED,//时钟频率
         .control_phase_bytes=1,//写数据或命令前,先发送的控制字节数
         .dc_bit_offset=6,//D/C#在第几位
@@ -92,16 +144,16 @@ void lvgl_init()
     lv_display_t *display=lv_display_create(OLED_WIDTH,OLED_HEIGHT);//创建显示对象
     lv_display_set_user_data(display,lcd_panel_hdl);//绑定显示对象和面板
 
-    size_t draw_buffer_size = OLED_WIDTH * OLED_HEIGHT / 8 + LVGL_PALETTE_SIZE;//lvgl*绘图*缓冲区,按照lvgl要求存储像素(像素数+8位调色盘)
+    size_t draw_buffer_size = OLED_WIDTH * OLED_HEIGHT / 8 + LVGL_PALETTE_SIZE;//lvgl*绘图*缓冲区,按照lvgl要求存储像素(像素数+8*8位调色盘)
     void *buffer=NULL;//lvgl绘图缓冲区指针
     buffer=heap_caps_calloc(1,draw_buffer_size,MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);//分配缓冲区内存
     assert(buffer);//检查内存分配是否成功
     lv_display_set_color_format(display,LV_COLOR_FORMAT_I1);//设置显示色深1bit
     lv_display_set_buffers(display,buffer,NULL,draw_buffer_size,LV_DISPLAY_RENDER_MODE_FULL);//初始化绘图缓冲区
-    lv_display_set_flush_cb(display,);
+    lv_display_set_flush_cb(display,lvgl_flush_cb);//注册刷新回调函数,当lvgl完成绘图后,调用回调函数将数据传入oled硬件缓冲区
 
     const esp_lcd_panel_io_callbacks_t lcd_io_cb={
-        .on_color_trans_done=notify_lvgl_flush_ready,//当lcd_io准备好接收下一帧数据时,调用该回调函数将
+        .on_color_trans_done=notify_lvgl_flush_ready,//当lcd_io准备好接收下一帧数据时,调用该回调函数通知lvgl刷新完成,可以进行下一帧绘制
     };
     esp_lcd_panel_io_register_event_callbacks(lcd_io_hdl,&lcd_io_cb,display);//注册lcd_io事件回调函数
 
