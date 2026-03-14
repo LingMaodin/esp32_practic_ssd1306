@@ -49,48 +49,28 @@ static void lvgl_flush_cb(lv_display_t *disp,lv_area_t *area,uint8_t *px)//将lv
     px+=LVGL_PALETTE_SIZE;//设置偏移量,跳过调色盘数据
     int x1=area->x1;
     int x2=area->x2;
-    int y1=area->y1;
-    int y2=area->y2;
-    uint8_t byte[8]={0};
-    uint8_t temp[8]={0};
-    for (int y = 0; y < y2/8-y1/8+1; y++)
+    int y1_fullpage=area->y1&0xF8;//清零低3位取整到整页
+    int y2_fullpage=(area->y2&0xF8)+7;//清零低三位再＋7取整到整页
+    uint8_t temp=0;//临时存1页像素
+    for (int y = y1_fullpage; y <= y2_fullpage; y+=8)//按页遍历刷新区域,每次处理8行像素
     {
-        for (int x = 0; x < x2-x1+1; x++)
+        uint8_t page=y>>3;//右移3位得到当前页号
+        for (int x = x1; x <= x2; x++)//逐列取出当前页对应的8个垂直像素
         {
-            temp[0]=px[(y1+y*8+0)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[1]=px[(y1+y*8+1)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[2]=px[(y1+y*8+2)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[3]=px[(y1+y*8+3)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[4]=px[(y1+y*8+4)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[5]=px[(y1+y*8+5)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[6]=px[(y1+y*8+6)*(OLED_WIDTH/8)+(x1+x)/8];
-            temp[7]=px[(y1+y*8+7)*(OLED_WIDTH/8)+(x1+x)/8];
-            for (int i = 0; i < 8; i++)
-            {
-                temp[0]=(temp[0]&0x80)>>7;//第[(y1行+行偏移量y)*(OLED_WIDTH/8)列+(x1列+列偏移量x)/8]个字节
-                temp[1]=(temp[1]&0x80)>>6;
-                temp[2]=(temp[2]&0x80)>>5;
-                temp[3]=(temp[3]&0x80)>>4;
-                temp[4]=(temp[4]&0x80)>>3;
-                temp[5]=(temp[5]&0x80)>>2;
-                temp[6]=(temp[6]&0x80)>>1;
-                temp[7]=(temp[7]&0x80)>>0;
-                byte[i]=temp[0]|temp[1]|temp[2]|temp[3]|temp[4]|temp[5]|temp[6]|temp[7];
-                //完成一个字节拼接后左移一位,方便再取第一位
-                temp[0]=px[(y1+y*8+0)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[1]=px[(y1+y*8+1)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[2]=px[(y1+y*8+2)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[3]=px[(y1+y*8+3)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[4]=px[(y1+y*8+4)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[5]=px[(y1+y*8+5)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[6]=px[(y1+y*8+6)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-                temp[7]=px[(y1+y*8+7)*(OLED_WIDTH/8)+(x1+x)/8]<<(1+i);
-            }
-            oled_buffer[(y1/8+y)*OLED_WIDTH+x1+x]=byte[(x1+x)%8];//第[(y1/8行+行偏移量y)*OLED_WIDTH列+(x1列+列偏移量x)]个字节
-            byte[(x1+x)%8]=0;
+            temp=0;//清零临时字节,准备重新打包这一列在当前页中的8个像素
+            uint8_t mask=0x80>>(x%8);//当前列在lvgl源缓冲区对应字节中的位掩码***非常天才的方法***
+            if (px[(y*OLED_WIDTH>>3)+(x>>3)]&mask)   temp|=0x01;//取第1行像素,放到页字节最低位
+            if (px[(y+1)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x02;//取第2行像素,放到页字节第1位
+            if (px[(y+2)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x04;//取第3行像素,放到页字节第2位
+            if (px[(y+3)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x08;//取第4行像素,放到页字节第3位
+            if (px[(y+4)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x10;//取第5行像素,放到页字节第4位
+            if (px[(y+5)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x20;//取第6行像素,放到页字节第5位
+            if (px[(y+6)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x40;//取第7行像素,放到页字节第6位
+            if (px[(y+7)*OLED_WIDTH>>3+(x>>3)]&mask) temp|=0x80;//取第8行像素,放到页字节最高位
+            oled_buffer[page*OLED_WIDTH+x]=temp;//写入oled页缓冲区中当前页的当前列
         }
     }
-    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel_hdl,x1,y1,x2+1,y2+1,oled_buffer));
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel_hdl,x1,y1_fullpage,x2+1,y2_fullpage+1,oled_buffer));
 }
 
 void ssd1306_init()
