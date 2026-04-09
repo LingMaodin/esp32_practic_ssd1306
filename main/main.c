@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
+#include <assert.h>
+#include <sys/lock.h>
 #include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -14,8 +16,8 @@
 #include "lvgl.h"
 #define I2C_SCL_NUM GPIO_NUM_11
 #define I2C_SDA_NUM GPIO_NUM_12
-#define I2C_ADDR 0x78
-#define I2C_SPEED 400*1000
+#define I2C_ADDR 0x3C
+#define I2C_SPEED (400*1000)
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define LVGL_TICK_PERIOD_MS 5
@@ -28,7 +30,8 @@ static esp_lcd_panel_io_handle_t lcd_io_hdl=NULL;//LCD IO接口句柄
 static esp_lcd_panel_handle_t lcd_panel_hdl=NULL;//LCD面板句柄
 static esp_timer_handle_t lvgl_tick_timer_hdl=NULL;//lvgl时钟定时器句柄
 static lv_display_t *display=NULL;//lvgl显示对象句柄
-static uint8_t oled_buffer[OLED_WIDTH*OLED_HEIGHT/8];//OLED*显示*缓冲区,负责传入硬件(每个像素1bit色深,占用1位.数组中每个元素8位,可以存储8个像素)
+static uint8_t oled_buffer_fullscreen[OLED_WIDTH*OLED_HEIGHT/8];//OLED*显示*缓冲区,负责传入硬件(每个像素1bit色深,占用1位.数组中每个元素8位,可以存储8个像素)
+static _lock_t lvgl_api_lock;//互斥锁,保护lvgl线程安全
 
 static void ssd1306_init()
 {
@@ -96,6 +99,7 @@ static void lvgl_flush_cb(lv_display_t *disp,const lv_area_t *area,uint8_t *px)/
     int y2_fullpage=(area->y2&0xF8)+7;//清零低三位再＋7取整到整页
     uint8_t temp=0;//临时存1页像素
     uint8_t page=0;//页号
+    //全局刷新模式
     for (int y = y1_fullpage; y <= y2_fullpage; y+=8)//按页遍历刷新区域,每次处理8行像素
     {
         page=y>>3;//右移3位得到当前页号
@@ -103,7 +107,7 @@ static void lvgl_flush_cb(lv_display_t *disp,const lv_area_t *area,uint8_t *px)/
         {
             temp=0;//清零临时字节,准备重新打包这一列在当前页中的8个像素
             uint8_t mask=0x80>>(x%8);//当前列在lvgl源缓冲区对应字节中的位掩码***非常天才的方法***
-            if (px[(y*OLED_WIDTH>>3)+(x>>3)]&mask)   temp|=0x01;//取第1行像素,放到页字节最低位
+            if (px[(y*OLED_WIDTH>>3)+(x>>3)]&mask)     temp|=0x01;//取第1行像素,放到页字节最低位
             if (px[((y+1)*OLED_WIDTH>>3)+(x>>3)]&mask) temp|=0x02;//取第2行像素,放到页字节第1位
             if (px[((y+2)*OLED_WIDTH>>3)+(x>>3)]&mask) temp|=0x04;//取第3行像素,放到页字节第2位
             if (px[((y+3)*OLED_WIDTH>>3)+(x>>3)]&mask) temp|=0x08;//取第4行像素,放到页字节第3位
@@ -111,10 +115,34 @@ static void lvgl_flush_cb(lv_display_t *disp,const lv_area_t *area,uint8_t *px)/
             if (px[((y+5)*OLED_WIDTH>>3)+(x>>3)]&mask) temp|=0x20;//取第6行像素,放到页字节第5位
             if (px[((y+6)*OLED_WIDTH>>3)+(x>>3)]&mask) temp|=0x40;//取第7行像素,放到页字节第6位
             if (px[((y+7)*OLED_WIDTH>>3)+(x>>3)]&mask) temp|=0x80;//取第8行像素,放到页字节最高位
-            oled_buffer[page*OLED_WIDTH+x]=temp;//写入oled页缓冲区中当前页的当前列
+            oled_buffer_fullscreen[page*OLED_WIDTH+x]=temp;//写入oled页缓冲区中当前页的当前列
         }
     }
-    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel_hdl,x1,y1_fullpage,x2+1,y2_fullpage+1,oled_buffer));
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel_hdl,x1,y1_fullpage,x2+1,y2_fullpage+1,oled_buffer_fullscreen));
+    /*局部刷新模式
+    int width=x2-x1+1;//刷新区域宽度
+    static uint8_t oled_buffer_partial[OLED_WIDTH * OLED_HEIGHT / 8 / 10];//局部刷新缓冲区
+    page=0;//从缓冲区第0页开始
+    for (int y = y1_fullpage; y <= y2_fullpage; y+=8)//按页遍历刷新区域,每次处理8行像素
+    {
+        for (int x = x1; x <= x2; x++)//逐列取出当前页对应的8个垂直像素
+        {
+            temp=0;//清零临时字节,准备重新打包这一列在当前页中的8个像素
+            uint8_t mask=0x80>>(x%8);//当前列在lvgl源缓冲区对应字节中的位掩码***非常天才的方法***
+            if (px[(y*width>>3)+(x>>3)]&mask)     temp|=0x01;//取第1行像素,放到页字节最低位
+            if (px[((y+1)*width>>3)+(x>>3)]&mask) temp|=0x02;//取第2行像素,放到页字节第1位
+            if (px[((y+2)*width>>3)+(x>>3)]&mask) temp|=0x04;//取第3行像素,放到页字节第2位
+            if (px[((y+3)*width>>3)+(x>>3)]&mask) temp|=0x08;//取第4行像素,放到页字节第3位
+            if (px[((y+4)*width>>3)+(x>>3)]&mask) temp|=0x10;//取第5行像素,放到页字节第4位
+            if (px[((y+5)*width>>3)+(x>>3)]&mask) temp|=0x20;//取第6行像素,放到页字节第5位
+            if (px[((y+6)*width>>3)+(x>>3)]&mask) temp|=0x40;//取第7行像素,放到页字节第6位
+            if (px[((y+7)*width>>3)+(x>>3)]&mask) temp|=0x80;//取第8行像素,放到页字节最高位
+            oled_buffer_partial[page*width+(x-x1)]=temp;//写入oled页缓冲区中当前页的当前列
+        }
+        page++;//下一页
+    }
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(lcd_panel_hdl,x1,y1_fullpage,x2+1,y2_fullpage+1,oled_buffer_partial));
+    */
 }
 
 static void lvgl_init()
@@ -126,14 +154,23 @@ static void lvgl_init()
     4.创建定时器--作为lvgl时钟
     */
     lv_init();
-    lv_display_set_user_data(display,lcd_panel_hdl);//绑定显示对象和面板
     display=lv_display_create(OLED_WIDTH,OLED_HEIGHT);//创建显示对象
-    size_t draw_buffer_size = OLED_WIDTH * OLED_HEIGHT / 8 + LVGL_PALETTE_SIZE;//lvgl*绘图*缓冲区,按照lvgl要求存储像素(像素数+8*8位调色盘)
+    lv_display_set_user_data(display,lcd_panel_hdl);//绑定显示对象和面板
+    //全局刷新模式
+    size_t draw_buffer_size_fullscreen = OLED_WIDTH * OLED_HEIGHT / 8 + LVGL_PALETTE_SIZE;//lvgl*绘图*缓冲区,按照lvgl要求存储像素(像素数+8*8位调色盘)
     void *buffer=NULL;//lvgl绘图缓冲区指针
-    buffer=heap_caps_calloc(1,draw_buffer_size,MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);//分配缓冲区内存
+    buffer=heap_caps_calloc(1,draw_buffer_size_fullscreen,MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);//分配缓冲区内存
     assert(buffer);//检查内存分配是否成功
     lv_display_set_color_format(display,LV_COLOR_FORMAT_I1);//设置颜色格式,T1模式:显示色深1bit,前8字节为调色盘
-    lv_display_set_buffers(display,buffer,NULL,draw_buffer_size,LV_DISPLAY_RENDER_MODE_FULL);//初始化绘图缓冲区
+    lv_display_set_buffers(display,buffer,NULL,draw_buffer_size_fullscreen,LV_DISPLAY_RENDER_MODE_FULL);//初始化绘图缓冲区
+    /*局部刷新模式
+    size_t draw_buffer_size_partial = OLED_WIDTH * OLED_HEIGHT / 8 /10 + LVGL_PALETTE_SIZE;//lvgl*绘图*缓冲区,按照lvgl要求存储像素(像素数+8*8位调色盘)
+    void *buffer=NULL;//lvgl绘图缓冲区指针
+    buffer=heap_caps_calloc(1,draw_buffer_size_partial,MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);//分配缓冲区内存
+    assert(buffer);//检查内存分配是否成功
+    lv_display_set_color_format(display,LV_COLOR_FORMAT_I1);//设置颜色格式,T1模式:显示色深1bit,前8字节为调色盘
+    lv_display_set_buffers(display,buffer,NULL,draw_buffer_size_partial,LV_DISPLAY_RENDER_MODE_PARTIAL);//初始化绘图缓冲区
+    */    
     lv_display_set_flush_cb(display,lvgl_flush_cb);//注册刷新回调函数,当lvgl完成绘图后,调用回调函数将数据传入oled硬件缓冲区
 
     const esp_lcd_panel_io_callbacks_t lcd_io_cb={
@@ -154,7 +191,9 @@ static void lvgl_task()
     uint32_t lvgl_delay_ms=0;
     while (1)
     {
+        _lock_acquire(&lvgl_api_lock);//保持互斥锁,保护lvgl线程安全
         lvgl_delay_ms=lv_timer_handler();
+        _lock_release(&lvgl_api_lock);//释放互斥锁
         lvgl_delay_ms=MAX(lvgl_delay_ms,LVGL_TASK_DELAY_MS_MIN);//取最小延时防止看门狗饿死
         lvgl_delay_ms=MIN(lvgl_delay_ms,LVGL_TASK_DELAY_MS_MAX);//取最大延时防止响应过慢
         usleep(1000*lvgl_delay_ms);//延时1000*lvgl_delay_ms微秒,即lvgl_delay_ms毫秒
@@ -168,7 +207,7 @@ static void lvgl_ui(lv_display_t *disp)
     lv_label_set_long_mode(label,LV_LABEL_LONG_MODE_SCROLL_CIRCULAR);//设置文本过长时显示模式为滚动循环
     lv_label_set_text(label,"Hello World.Hello LMD");//设置文本
     lv_obj_set_width(label,lv_display_get_horizontal_resolution(disp));//设置标签宽度为屏幕宽度
-    lv_obj_align(label,LV_ALIGN_OUT_TOP_MID,0,0);//标签对齐到屏幕顶部中央
+    lv_obj_align(label,LV_ALIGN_TOP_MID,0,0);//标签对齐到屏幕顶部中央
 }
 
 void app_main(void)
@@ -184,5 +223,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_panel_hdl,true));//点亮面板
     lvgl_init();//lvgl初始化
     xTaskCreatePinnedToCore(lvgl_task,"LVGL",4096,NULL,5,NULL,0);//创建lvgl任务
+    _lock_acquire(&lvgl_api_lock);//保持互斥锁
     lvgl_ui(display);//显示
+    _lock_release(&lvgl_api_lock);//释放互斥锁
 }
