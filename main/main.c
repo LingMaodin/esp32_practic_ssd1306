@@ -14,10 +14,10 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "lvgl.h"
-#define I2C_SCL_NUM GPIO_NUM_11
-#define I2C_SDA_NUM GPIO_NUM_12
-#define I2C_ADDR 0x3C
-#define I2C_SPEED (400*1000)
+#define I2C_SCL_NUM GPIO_NUM_9
+#define I2C_SDA_NUM GPIO_NUM_10
+#define I2C_ADDR 0x3C 
+#define I2C_SPEED (100*1000)
 #define OLED_WIDTH 128
 #define OLED_HEIGHT 64
 #define LVGL_TICK_PERIOD_MS 5
@@ -47,7 +47,7 @@ static void ssd1306_init()
         .sda_io_num=I2C_SDA_NUM,
         .i2c_port=0,//选择总线0
         .glitch_ignore_cnt=7,//毛刺过滤器
-        .flags.enable_internal_pullup=true,//开启内部上拉
+        .flags.enable_internal_pullup=false,//关闭内部上拉
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg,&i2c_bus_hdl));//新建I2C总线
 
@@ -91,7 +91,7 @@ static bool notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t io_hdl, esp_lcd_pa
 
 static void lvgl_flush_cb(lv_display_t *disp,const lv_area_t *area,uint8_t *px)//将lvgl绘图缓冲区数据传入oled硬件缓冲区
 {
-    esp_lcd_panel_handle_t lcd_panel_hdl=lv_display_get_user_data(disp);
+    lcd_panel_hdl=lv_display_get_user_data(disp);
     px+=LVGL_PALETTE_SIZE;//设置偏移量,跳过调色盘数据
     int x1=area->x1;
     int x2=area->x2;
